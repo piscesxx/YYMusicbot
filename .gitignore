@@ -1,0 +1,35 @@
+__pycache__/
+*.pyc
+*.pyo
+*.jsonl
+*.log
+
+CredentialData.json
+
+.venv/
+venv/
+
+# 个人配置
+.claude/
+
+# 缓存文件
+yy-cef-lx-bot/audio_cache/
+yy-cef-lx-bot/yy_audio_cache/
+song_queue.json
+
+# 临时文件
+hotlist.json
+verify_result.txt
+
+# 二进制文件
+*.exe
+*.7z
+
+# 旧版代码
+legacy_uia/
+SendYYMessages.py
+GetYYChatRecords.py
+MyYYBot.py
+Login.py
+MusicPlayer.py
+QQMusicApi.py

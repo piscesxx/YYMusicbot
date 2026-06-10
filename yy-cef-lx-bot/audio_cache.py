@@ -160,6 +160,113 @@ if (!handler) throw new Error('音源脚本未注册 request handler')
     return url
 
 
+# 换源搜索解析 — 尝试从 keyword 搜索歌曲并解析音频 URL
+FALLBACK_SOURCES = ["wy", "kg", "kw", "mg"]
+
+
+def search_and_resolve(source: str, keyword: str, quality: str = "128k",
+                       script_path: Path | None = None) -> str:
+    """通过 JS 音源脚本的 search 接口搜索歌曲，再解析音频下载 URL。
+
+    先用 keyword 搜索，取第一个结果重新 musicUrl 解析。用于换源降级。
+    """
+    script = script_path or _find_source_script()
+
+    node_code = r'''
+const fs = require('fs')
+const vm = require('vm')
+const payload = JSON.parse(process.argv[1])
+let handler = null
+const EVENT_NAMES = { request: 'request', inited: 'inited' }
+const request = async (url, options, cb) => {
+  try {
+    const resp = await fetch(url, {
+      method: options?.method || 'GET',
+      headers: options?.headers || {},
+      body: options?.body,
+    })
+    const text = await resp.text()
+    cb(null, { statusCode: resp.status, headers: Object.fromEntries(resp.headers.entries()), body: text })
+  } catch (err) { cb(err) }
+}
+const lx = { EVENT_NAMES, request, on: (name, fn) => { if (name === EVENT_NAMES.request) handler = fn }, send: () => {}, env: 'desktop', version: '2.12.2' }
+const sandbox = { console: { log: () => {}, error: () => {}, warn: () => {} }, globalThis: { lx }, setTimeout, clearTimeout, URL, URLSearchParams, Buffer }
+sandbox.globalThis.globalThis = sandbox.globalThis
+vm.createContext(sandbox)
+vm.runInContext(fs.readFileSync(payload.scriptPath, 'utf8'), sandbox, { filename: payload.scriptPath })
+if (!handler) throw new Error('音源脚本未注册 request handler')
+;(async () => {
+  let url = null
+  // 1. search
+  let searchResp
+  try {
+    searchResp = await Promise.race([
+      handler({ source: payload.source, action: 'search', info: { keyword: payload.keyword, page: 1, type: 'music' } }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('search timeout')), 15000)),
+    ])
+  } catch (e) { searchResp = null }
+  // 2. 从搜索结果中提取第一个
+  let first = null
+  if (searchResp) {
+    const raw = searchResp.data || searchResp
+    const list = Array.isArray(raw) ? raw : (raw.list || [])
+    if (list.length > 0) first = list[0]
+  }
+  if (!first) throw new Error('search returned no results')
+  // 3. resolve
+  const info = {
+    musicInfo: {
+      songmid: first.songmid || first.id || '',
+      songId: first.songId || first.id || '',
+      id: first.id || '',
+      hash: first.hash || '',
+      name: first.name || payload.keyword,
+      singer: first.singer || '',
+    },
+    type: payload.quality,
+  }
+  try {
+    const result = await Promise.race([
+      handler({ source: payload.source, action: 'musicUrl', info }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('resolve timeout')), 15000)),
+    ])
+    url = result && result.url
+  } catch (e) {}
+  if (!url) throw new Error('resolve failed after search')
+  process.stdout.write(JSON.stringify({ url }))
+})().catch(err => { process.stderr.write(err.message || String(err)); process.exit(1) })
+'''
+    payload = {
+        "scriptPath": str(script),
+        "source": source,
+        "keyword": keyword,
+        "quality": quality,
+    }
+    try:
+        completed = subprocess.run(
+            ["node", "-e", node_code, json.dumps(payload, ensure_ascii=False)],
+            capture_output=True, text=True, encoding="utf-8", timeout=RESOLVE_TIMEOUT,
+        )
+    except FileNotFoundError:
+        raise AudioResolveError("未找到 Node.js，请确认已安装")
+    except subprocess.TimeoutExpired:
+        raise AudioResolveError(f"音源脚本搜索解析超时 ({RESOLVE_TIMEOUT}s): {keyword}")
+
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip() or "未知错误"
+        raise AudioResolveError(f"换源搜索解析失败: {stderr}")
+
+    try:
+        data = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        raise AudioResolveError(f"换源输出解析失败: {completed.stdout[:100]}")
+
+    url = data.get("url")
+    if not url:
+        raise AudioResolveError("换源解析没有返回播放 URL")
+    return url
+
+
 # ================================================================
 #  Lx Music 数据库读取
 # ================================================================
@@ -324,7 +431,7 @@ QQ_LEADERBOARDS_NORM: dict[str, tuple[str, int]] = {
 }
 
 
-def fetch_qq_leaderboard(topid: int, num: int = 100) -> list[dict[str, str]]:
+def fetch_qq_leaderboard(topid: int, num: int = 100) -> list[dict[str, Any]]:
     """从 QQ 音乐公开 API 获取排行榜歌曲列表。
 
     Args:
@@ -332,7 +439,17 @@ def fetch_qq_leaderboard(topid: int, num: int = 100) -> list[dict[str, str]]:
         num: 获取歌曲数量
 
     Returns:
-        [{"songName": str, "singer": str}, ...]
+        [{
+            "songName": str, "singer": str,
+            "mid": str,              # QQ songmid
+            "id": int,               # QQ 数字 ID
+            "interval": int,         # 时长（秒）
+            "albumName": str,
+            "albumMid": str,
+            "mediaMid": str,         # file.media_mid
+            "fileSizes": dict,       # {"128k": bytes, "320k": bytes, "flac": bytes}
+            "picUrl": str,           # 专辑封面 URL
+        }, ...]
 
     Raises:
         RuntimeError: API 请求失败或数据异常
@@ -373,8 +490,38 @@ def fetch_qq_leaderboard(topid: int, num: int = 100) -> list[dict[str, str]]:
         singer = "、".join(
             ns.get("name", "") for ns in singers if isinstance(ns, dict)
         )
-        if name and singer:
-            song_list.append({"songName": name, "singer": singer})
+        if not name or not singer:
+            continue
+
+        mid = s.get("mid", "")
+        sid = s.get("id", 0)
+        interval_sec = s.get("interval", 0)
+        album = s.get("album") or {}
+        album_name = album.get("name", "")
+        album_mid = album.get("mid", "")
+        pic_url = f"https://y.gtimg.cn/music/photo_new/T002R500x500M000{album_mid}.jpg" if album_mid else ""
+        file_info = s.get("file") or {}
+        media_mid = file_info.get("media_mid", "")
+        file_sizes = {}
+        if file_info.get("size_128mp3"):
+            file_sizes["128k"] = file_info["size_128mp3"]
+        if file_info.get("size_320mp3"):
+            file_sizes["320k"] = file_info["size_320mp3"]
+        if file_info.get("size_flac"):
+            file_sizes["flac"] = file_info["size_flac"]
+
+        song_list.append({
+            "songName": name,
+            "singer": singer,
+            "mid": mid,
+            "id": sid,
+            "interval": interval_sec,
+            "albumName": album_name,
+            "albumMid": album_mid,
+            "mediaMid": media_mid,
+            "fileSizes": file_sizes,
+            "picUrl": pic_url,
+        })
 
     return song_list
 
@@ -438,6 +585,116 @@ def switch_to_local_playlist(playlist_id: str) -> dict[str, Any]:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
     return info
+
+
+# ================================================================
+#  排行榜 → SQLite 临时歌单
+# ================================================================
+
+TEMP_PLAYLIST_PREFIX = "_temp_qq_toplist_"
+
+
+def _interval_str(seconds: int) -> str:
+    m, s = divmod(int(seconds), 60)
+    return f"{m:02d}:{s:02d}"
+
+
+def _human_size(size_bytes: int) -> str:
+    if size_bytes <= 0:
+        return "0 B"
+    mb = size_bytes / (1024 * 1024)
+    return f"{mb:.2f} MB"
+
+
+def _build_qq_meta(song: dict[str, Any]) -> str:
+    """构建 QQ 歌曲的 meta JSON。"""
+    file_sizes = song.get("fileSizes") or {}
+    album_mid = song.get("albumMid", "")
+    pic_url = song.get("picUrl", "")
+    if not pic_url and album_mid:
+        pic_url = f"https://y.gtimg.cn/music/photo_new/T002R500x500M000{album_mid}.jpg"
+
+    qualitys = []
+    _qualitys = {}
+    q_keys = [("128k", "128k"), ("320k", "320k"), ("flac", "flac")]
+    for q_key, q_label in q_keys:
+        size_bytes = file_sizes.get(q_key, 0)
+        if size_bytes > 0:
+            size_str = _human_size(size_bytes)
+            qualitys.append({"type": q_label, "size": size_str})
+            _qualitys[q_label] = {"size": size_str}
+
+    meta = {
+        "songId": song.get("mid", ""),
+        "albumName": song.get("albumName", ""),
+        "picUrl": pic_url,
+        "qualitys": qualitys,
+        "_qualitys": _qualitys,
+        "albumId": album_mid,
+        "strMediaMid": song.get("mediaMid", ""),
+        "id": song.get("id", 0),
+        "albumMid": album_mid,
+    }
+    return json.dumps(meta, ensure_ascii=False)
+
+
+def delete_temp_playlist(list_id: str) -> None:
+    """删除临时歌单及其所有歌曲记录。"""
+    try:
+        conn = _db_connect()
+        conn.execute("DELETE FROM my_list_music_info_order WHERE listId=?", (list_id,))
+        conn.execute("DELETE FROM my_list_music_info WHERE listId=?", (list_id,))
+        conn.execute("DELETE FROM my_list WHERE id=?", (list_id,))
+        conn.commit()
+        conn.close()
+    except (FileNotFoundError, sqlite3.Error):
+        pass
+
+
+def create_qq_leaderboard_playlist(topid: int, songs: list[dict[str, Any]]) -> str:
+    """在 SQLite 中创建临时排行榜歌单，返回 playlist_id。
+
+    会先清理同 topid 的旧临时歌单，再创建新的。
+    """
+    list_id = f"{TEMP_PLAYLIST_PREFIX}{topid}"
+    # 反向查找 topid 对应的排行榜名称
+    display_name = next((name for name, tid in QQ_LEADERBOARDS.items() if tid == topid), f"QQ排行榜_{topid}")
+
+    conn = _db_connect()
+    try:
+        # 清理旧临时歌单
+        delete_temp_playlist(list_id)
+
+        # 创建歌单
+        conn.execute(
+            "INSERT INTO my_list (id, name, source, sourceListId, position) VALUES (?, ?, ?, ?, ?)",
+            (list_id, display_name, "tx", f"board__tx__{topid}", 999),
+        )
+
+        # 插入歌曲
+        for order, song in enumerate(songs):
+            mid = song.get("mid", "")
+            music_id = f"tx_{mid}"
+            interval_str = _interval_str(song.get("interval", 0))
+            meta_str = _build_qq_meta(song)
+
+            conn.execute(
+                "INSERT OR REPLACE INTO my_list_music_info (id, listId, name, singer, source, interval, meta) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (music_id, list_id, song["songName"], song["singer"], "tx", interval_str, meta_str),
+            )
+            conn.execute(
+                "INSERT INTO my_list_music_info_order (listId, musicInfoId, \"order\") VALUES (?, ?, ?)",
+                (list_id, music_id, order),
+            )
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    return list_id
 
 
 # ================================================================
@@ -641,16 +898,11 @@ class CacheScheduler:
             self._last_list_id = list_id
             self._last_index = -1
 
-        # 歌曲推进 → 删除已播完的缓存文件
+        # 歌曲推进 → 清理状态跟踪（文件保留，避免 Lx Music 重读时 404）
         if cur_index > self._last_index:
             for order in list(self._order_to_file):
                 if order <= cur_index:
-                    fpath = self._order_to_file.pop(order, None)
-                    if fpath and fpath.exists():
-                        try:
-                            fpath.unlink()
-                        except OSError:
-                            pass
+                    self._order_to_file.pop(order, None)
             self._cached_orders = {o for o in self._cached_orders if o > cur_index}
             self._last_index = cur_index
 
@@ -688,15 +940,26 @@ class CacheScheduler:
 
     @staticmethod
     def clean_orphaned():
-        """删除缓存目录中所有文件（启动时清理旧缓存）。"""
-        if not CACHE_DIR.exists():
-            return
-        for f in CACHE_DIR.iterdir():
-            if f.is_file():
-                try:
-                    f.unlink()
-                except OSError:
-                    pass
+        """删除缓存目录中所有文件并清理 stale music_url 条目（启动时清理）。"""
+        # 删文件
+        if CACHE_DIR.exists():
+            for f in CACHE_DIR.iterdir():
+                if f.is_file():
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
+        # 清理指向本地缓存的 music_url 记录，避免 Lx Music 请求已删除的文件
+        try:
+            conn = _db_connect()
+            conn.execute("DELETE FROM music_url WHERE url LIKE ?", ("%127.0.0.1%",))
+            conn.execute("DELETE FROM music_url WHERE url LIKE ?", ("%localhost%",))
+            conn.commit()
+            conn.close()
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            sys.stderr.write(f"[Cache] 清理 music_url 失败: {exc}\n")
 
     def status_text(self) -> str:
         """返回缓存状态文本。"""
@@ -721,7 +984,8 @@ class CacheScheduler:
     def _cache_one(self, song: dict[str, Any]) -> Path | None:
         """解析单个歌曲的 URL，下载到缓存，注入本地 URL。
 
-        如果目标音质解析或下载失败，自动降级重试。
+        先以歌曲原生 source 尝试解析并缓存；
+        若失败则以歌名+歌手为 keyword 对其他源进行搜索降级。
         返回缓存文件路径，完全失败返回 None。
         """
         name = song["name"]
@@ -735,6 +999,8 @@ class CacheScheduler:
                 raw_song_id = song_id[len(prefix):]
                 break
 
+        keyword = f"{name} - {singer}"
+
         # 优先目标音质，解析或下载失败后降级
         qualities_to_try = [self.quality]
         fallbacks = {"flac24bit": ["flac", "320k", "128k"],
@@ -744,29 +1010,40 @@ class CacheScheduler:
         if self.quality in fallbacks:
             qualities_to_try.extend(f for f in fallbacks[self.quality] if f not in qualities_to_try)
 
+        # 尝试源列表：原生源 → 降级源
+        source_list = [source] + [s for s in FALLBACK_SOURCES if s != source]
         last_error = None
-        for q in qualities_to_try:
-            try:
-                url = resolve_audio_url(source, raw_song_id, name, singer, q, self.source_script)
-                ext = _guess_ext(url)
-                filename = _safe_filename(song_id, ext)
-                dest = CACHE_DIR / filename
-                if not dest.exists():
-                    download_audio(url, dest)
 
-                local_url = self.http_server.url_for(filename)
-                inject_local_url(song_id, source, local_url, self.quality)
-                return dest
-            except (AudioResolveError, subprocess.TimeoutExpired) as e:
-                last_error = e
-            except Exception as e:
-                msg = str(e)
-                if "404" in msg:
-                    last_error = f"{q} 下载 404"
-                else:
-                    last_error = f"{q} 下载失败: {msg}"
+        for fb_source in source_list:
+            for q in qualities_to_try:
+                try:
+                    if fb_source == source:
+                        url = resolve_audio_url(source, raw_song_id, name, singer, q, self.source_script)
+                    else:
+                        # 降级源：用歌名代替 ID，由聚合脚本内部处理
+                        url = resolve_audio_url(fb_source, name, name, singer, q, self.source_script)
 
-        sys.stderr.write(f"[Cache] 所有音质缓存失败 [{song.get('order')}] {singer} - {name}: {last_error}\n")
+                    ext = _guess_ext(url)
+                    filename = _safe_filename(song_id, ext)
+                    dest = CACHE_DIR / filename
+                    if not dest.exists():
+                        download_audio(url, dest)
+
+                    local_url = self.http_server.url_for(filename)
+                    # 始终以原始 source + song_id 注入，确保 Lx Music 能命中本地缓存
+                    inject_local_url(song_id, source, local_url, self.quality)
+                    return dest
+                except (AudioResolveError, subprocess.TimeoutExpired) as e:
+                    last_error = e
+                except Exception as e:
+                    msg = str(e)
+                    if "404" in msg:
+                        last_error = f"{q} 下载 404"
+                    else:
+                        last_error = str(e)
+
+        if last_error:
+            sys.stderr.write(f"[Cache] 所有音质/源缓存失败 [{song.get('order')}] {singer} - {name}: {last_error}\n")
         return None
 
 

@@ -1,29 +1,108 @@
 # YYBot
-YY语音播放器
 
-# 简介
-此项目用于在YY语音播放音乐，有点歌、导入歌单、打印提示、读出公屏文字的功能，但目前音乐api仅支持QQ音乐歌曲。
+当前主线是 **YY CEF + Lx Music Desktop** 方案：
 
-# 快速开始
+- 通过 YY 客户端 CEF 页面内部 API 读取公屏消息
+- 通过 YY 客户端 CEF 页面内部 API 发送公屏反馈
+- 通过 Lx Music Desktop Open API / Scheme 控制播放器
+- 通过 `yy://pd-[sid=...]` 切换频道，并在切换后重新接管新的频道页继续监听
+
+## 当前主入口
+
+在项目根目录运行：
+
+```bash
+python yy-cef-lx-bot/mini_bot.py
+```
+
+更细的启动说明、命令说明和调试说明见：
+
+- `yy-cef-lx-bot/README.md`
+- `docs/architecture.md`
+- `docs/legacy-notes.md`
+
+## 技术路线
+
+### 1. YY 公屏读写
+
+当前方案不是浏览器公开 SDK，也不是 OCR，也不是 UI 自动化主链路。
+
+实际使用的是：
+
+- Chrome DevTools Protocol 连接 YY 内部 CEF 页面
+- `YY.Channel.ChannelMessage.getCacheMessage()` 读取公屏缓存
+- `yy.chat.sendPublicMessage()` 发送公屏反馈
+
+### 2. Lx Music 控制
+
+播放器控制分成两类：
+
+- **Open API**：状态、暂停/继续、上一首、下一首、音量
+- **Scheme**：点歌、播放歌单、打开歌单等
+
+### 3. 频道切换
+
+当前主方案是：
+
+- `yy://pd-[sid=<asid>]`
+
+切换后会重新扫描频道页并重绑 DevTools websocket，继续监听新频道公屏。
+
 ## 环境要求
-- 3.10 =< python < 3.14
-- pygame
-- qqmusic-api-python，详情见https://github.com/l-1124/QQMusicApi
-- pywinauto
-- edge_tts
-## 基本使用
-MyYYBot为本项目的入口文件，运行该文件并按照控制台的提示登录QQ音乐的账号，然后输入YY语音房间窗口的标题（YY房间号-YY房间名称），然后播放器会自动获取YY公屏信息来进行点歌。
-## 点歌功能
-在YY公屏输入点歌xx（歌名）
-## 导入歌单
-在YY公屏输入点导入歌单xx（歌单的id）
-## 阅读功能
-在YY公屏输入读xx（内容）
 
-# 注意
-- 本项目需要有QQ音乐的账号登录，并且VIP歌曲无法免费播放，本质上就是登录你的账号去官网请求音乐。
-- 账号登录后的凭证会被保存在CredentialData.json文件中请妥善保管。
-- 不能最小化YY窗口，并且需要点击一下YY的输入框否则播放器的打字功能会无法使用。
+- Python 3.10 - 3.13
+- Windows 桌面环境
+- YY 客户端
+- Lx Music Desktop，并在设置中开启开放 API 服务
+- Python 依赖：
 
-# License
+```bash
+pip install websocket-client requests edge-tts pygame
+```
+
+如果你只使用纯文本反馈而不需要 TTS，`edge-tts` 和 `pygame` 不是硬性必需。
+
+## 当前功能
+
+- 公屏命令监听
+- 公屏反馈发送
+- 当前歌曲查询
+- 暂停 / 继续
+- 上一首 / 下一首
+- 绝对音量设置
+- 相对音量增减
+- 点歌
+- 歌单打开 / 播放
+- 频道切换
+- 切换后持续监听新频道
+- 可选 TTS 反馈
+
+## 历史内容说明
+
+仓库中仍保留部分历史试验与旧路线内容，方便后续排障或回顾：
+
+- `yy-sdk-probe/`
+- `yy-ocr-benchmark/`
+- `yy-cef-probe/`
+- `legacy_uia/`
+
+这些目录都**不是当前主线实现**。
+
+其中：
+
+- `legacy_uia/` 是旧 UI 自动化 fallback 方案
+- 其余 probe / benchmark 目录是历史验证材料
+
+## 运行建议
+
+本项目适合运行在 **Windows 可交互桌面环境** 中，不适合普通无界面 Linux 服务器，也不建议把完整机器人直接作为 Docker 化主部署方案。
+
+原因：
+
+- YY 是 Windows 桌面应用
+- Lx Music Desktop 也是桌面应用
+- 频道切换和 CEF 页面接管依赖本机桌面客户端状态
+
+## License
+
 本项目基于 MIT License 许可证发行。
