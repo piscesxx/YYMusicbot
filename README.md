@@ -12,14 +12,13 @@
 在项目根目录运行：
 
 ```bash
-python yy-cef-lx-bot/mini_bot.py
+python mini_bot.py
 ```
 
 更细的启动说明、命令说明和调试说明见：
 
-- `yy-cef-lx-bot/README.md`
+- `cef/` — CEF 调试工具（cef_probe、yy_cef_probe）
 - `docs/architecture.md`
-- `docs/legacy-notes.md`
 
 ## 技术路线
 
@@ -77,21 +76,26 @@ pip install websocket-client requests edge-tts pygame
 - 切换后持续监听新频道
 - 可选 TTS 反馈
 
+## 项目结构
+
+```
+mini_bot.py              # 主入口
+audio_cache.py           # 音频缓存模块
+lx_bot/                  # Lx Music API 封装
+sources/                 # 音源 JS 脚本
+cef/                     # CEF 调试/探测工具
+docs/                    # 文档
+```
+
 ## 历史内容说明
 
 仓库中仍保留部分历史试验与旧路线内容，方便后续排障或回顾：
 
 - `yy-sdk-probe/`
 - `yy-ocr-benchmark/`
-- `yy-cef-probe/`
 - `legacy_uia/`
 
 这些目录都**不是当前主线实现**。
-
-其中：
-
-- `legacy_uia/` 是旧 UI 自动化 fallback 方案
-- 其余 probe / benchmark 目录是历史验证材料
 
 ## 运行建议
 

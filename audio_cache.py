@@ -60,8 +60,8 @@ RESOLVE_TIMEOUT = 30   # 音源脚本超时秒数
 POLL_INTERVAL = 3      # 轮询间隔秒数
 
 # 音源脚本路径 (从 test_yy_audio_source.py 沿用)
-ROOT_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_SOURCE_SCRIPT = ROOT_DIR / "全豆要-聚合音源 v3.0.0.js"
+ROOT_DIR = Path(__file__).resolve().parent
+DEFAULT_SOURCE_SCRIPT = ROOT_DIR / "sources" / "全豆要-聚合音源 v3.0.0.js"
 
 
 # ================================================================
@@ -76,9 +76,11 @@ def _find_source_script() -> Path:
     """依次查找可用的音源脚本"""
     candidates = [
         DEFAULT_SOURCE_SCRIPT,
+        ROOT_DIR / "全豆要-聚合音源 v3.0.0.js",
         Path("全豆要-聚合音源 v3.0.0.js"),
         *list(Path(".").glob("*聚合音源*.js")),
         *list(Path(".").glob("*音源*.js")),
+        *list(Path("sources").glob("*聚合音源*.js")),
     ]
     for p in candidates:
         if p.exists():

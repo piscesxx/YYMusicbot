@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import argparse
 import asyncio
 import json
@@ -10,7 +12,6 @@ import webbrowser
 from collections import deque
 from dataclasses import dataclass, asdict
 from itertools import count
-from pathlib import Path
 from typing import Any
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -1108,13 +1109,21 @@ def run_bot(args):
 
                 # 检测用户进入频道，自动发送欢迎语音
                 text = row.get("text") or ""
-                uid = str(row.get("uid") or "")
-                if uid and uid not in _welcomed_uids and ("进入频道" in text or "进入了频道" in text):
-                    _welcomed_uids.add(uid)
-                    nick = row.get("nick") or "朋友"
-                    welcome_text = f"欢迎 {nick} 来到频道"
-                    print(f"欢迎新用户: {nick} uid={uid}")
-                    speak_async(welcome_text, True)
+                # 格式: 通知： [[U]开心[/U]] 进入 [听歌练枪] 频道。(10:02:20)
+                # 格式: 通知： [鱼摆摆] 进入 [听歌练枪] 频道。(10:03:02)
+                if " 进入 [" in text:
+                    # 提取昵称: 从 "通知： [" 之后到 "] 进入" 之前
+                    nick_match = re.search(r"通知：\s*\[(.+?)\]\s*进入\s*\[", text)
+                    nick = nick_match.group(1) if nick_match else "朋友"
+                    # 去掉可能的 [U][/U] 格式标签
+                    nick = re.sub(r"\[/?U\]", "", nick)
+                    print(f"[进入频道] nick={nick} text={text}")
+                    dedup_key = f"enter:{nick}:{text[-20:]}"
+                    if dedup_key not in _welcomed_uids:
+                        _welcomed_uids.add(dedup_key)
+                        welcome_text = f"欢迎 {nick} 进入频道"
+                        print(f"→ 发送欢迎: {welcome_text}")
+                        speak_async(welcome_text, True)
 
                 if row.get("msgType") != 2:
                     continue

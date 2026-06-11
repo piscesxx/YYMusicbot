@@ -13,9 +13,12 @@ venv/
 .claude/
 
 # 缓存文件
-yy-cef-lx-bot/audio_cache/
-yy-cef-lx-bot/yy_audio_cache/
+audio_cache/
+yy_audio_cache/
 song_queue.json
+
+# 探测日志
+cef/*.jsonl
 
 # 临时文件
 hotlist.json
