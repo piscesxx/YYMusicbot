@@ -26,25 +26,29 @@ except ImportError as exc:
 try:
     from audio_cache import (
         CacheScheduler, PRESET_PLAYLISTS, PRESET_NAMES,
-        QQ_LEADERBOARDS, QQ_LEADERBOARDS_NORM,
-        fetch_qq_leaderboard, read_playback_state,
+        WY_LEADERBOARDS, WY_LEADERBOARDS_NORM,
+        read_playback_state,
         read_all_playlists, switch_to_local_playlist,
-        create_qq_leaderboard_playlist, delete_temp_playlist,
+        download_audio,
+        CACHE_DIR, _db_connect,
     )
     HAS_AUDIO_CACHE = True
 except ImportError:
     CacheScheduler = None
     PRESET_PLAYLISTS = {}
     PRESET_NAMES = {}
-    QQ_LEADERBOARDS = {}
-    QQ_LEADERBOARDS_NORM = {}
-    fetch_qq_leaderboard = None
+    WY_LEADERBOARDS = {}
+    WY_LEADERBOARDS_NORM = {}
     read_playback_state = lambda: {}
     read_all_playlists = lambda: []
     switch_to_local_playlist = None
-    create_qq_leaderboard_playlist = None
-    delete_temp_playlist = None
+    download_audio = None
+    CACHE_DIR = None
+    _db_connect = None
     HAS_AUDIO_CACHE = False
+
+# 切歌检测
+_last_song_key: str = ""
 
 
 HTTP_TIMEOUT = 0.25
@@ -229,6 +233,19 @@ class SongQueue:
         self.current_started_at = 0.0
         self.signature_ready_at = 0.0
         self.save_state()
+
+    def clear_all(self):
+        """清空全部队列、历史、当前歌曲，并删除持久化文件。"""
+        self.items.clear()
+        self.history.clear()
+        self.current = None
+        self.current_signature = None
+        self.current_started_at = 0.0
+        self.signature_ready_at = 0.0
+        try:
+            QUEUE_STATE_FILE.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"删除点歌队列持久化文件失败: {exc}")
 
 
 class DevToolsClient:
@@ -665,8 +682,68 @@ def is_lx_playing() -> bool:
 
 
 def start_song_request(request: SongRequest) -> str:
+    # 拍照：记录当前 music_url 表的 key，用于后续对比找出新增的 URL
+    before_keys = _snapshot_music_url_keys() if HAS_AUDIO_CACHE else set()
+
     LxMusicApi.search_play(request.keyword)
+
+    if HAS_AUDIO_CACHE:
+        threading.Thread(target=_cache_point_song_delayed,
+                         args=(request.keyword, before_keys), daemon=True).start()
     return f"〖即将为您播放：{request.display_text}〗"
+
+
+def _snapshot_music_url_keys() -> set[str]:
+    """读取当前 music_url 表的所有 key。"""
+    try:
+        from audio_cache import _db_connect
+        conn = _db_connect()
+        rows = conn.execute("SELECT id FROM music_url").fetchall()
+        conn.close()
+        return {r["id"] for r in rows}
+    except Exception:
+        return set()
+
+
+def _cache_point_song_delayed(keyword: str, before_keys: set[str], delay: int = 5):
+    """searchPlay 后延迟几秒，从 music_url 表取 Lx 已解析的 URL 缓存到本地。
+
+    不走 JS 脚本，利用 Lx 内置 SDK 已解析好的 URL。
+    """
+    import hashlib
+    time.sleep(delay)
+
+    try:
+        conn = _db_connect()
+        after = conn.execute("SELECT id, url FROM music_url").fetchall()
+        conn.close()
+    except Exception as exc:
+        print(f"[点歌缓存] 读 music_url 失败: {exc}")
+        return
+
+    # 找出新增 key（即 searchPlay 后 Lx 解析写入的新 URL）
+    new_entries = [dict(r) for r in after if r["id"] not in before_keys]
+    if not new_entries:
+        print(f"[点歌缓存] 未发现新增 URL (可能还没解析完成): {keyword}")
+        return
+
+    print(f"[点歌缓存] 发现 {len(new_entries)} 个新增 URL，开始下载: {keyword}")
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    dest = CACHE_DIR / f"point_{hashlib.md5(keyword.encode()).hexdigest()[:16]}.mp3"
+
+    for entry in new_entries:
+        url = entry["url"]
+        if not url or "127.0.0.1" in url or "localhost" in url:
+            continue
+        try:
+            download_audio(url, dest)
+            print(f"[点歌缓存] 成功: {entry['id']} -> {dest}")
+            return
+        except Exception as e:
+            print(f"[点歌缓存] 下载失败 {entry['id']}: {e}")
+            continue
+
+    print(f"[点歌缓存] 所有新增 URL 下载均失败: {keyword}")
 
 
 def play_previous_request(queue: SongQueue) -> str:
@@ -705,49 +782,21 @@ def update_song_queue(api: YYCefApi, queue: SongQueue):
 def _switch_board_playlist(source: str, source_list_id: str, display_name: str) -> str:
     """切换 Lx Music 内置 board__ 歌单（通过修改 data.json）。"""
     if switch_to_local_playlist is None:
-        return "音频缓存模块不可用"
+        return "😴 音频缓存模块还没准备好呢，稍后再试吧～"
     try:
         local_pls = read_all_playlists()
     except Exception as exc:
-        return f"读取本地歌单失败: {exc}"
+        return f"😵 读取本地歌单出错了...{exc}"
     for pl in local_pls:
         if pl.get("source") == source and pl.get("sourceListId") == source_list_id:
             try:
                 info = switch_to_local_playlist(pl["id"])
                 time.sleep(0.5)
                 LxMusicApi.play()
-                return f"已切换歌单：{info.get('name', display_name)}"
+                return f"🎶 已切换歌单：{info.get('name', display_name)}，开始享受音乐吧～"
             except Exception as exc:
-                return f"切换歌单失败: {exc}"
-    return f"歌单「{display_name}」的本地数据未找到，请先在 Lx Music 中添加该歌单。"
-
-
-def _play_qq_leaderboard(display_name: str, topid: int) -> str:
-    """通过 QQ 音乐 API 拉取排行榜，写入 SQLite 临时歌单并切换到 Lx Music 播放。"""
-    if not HAS_AUDIO_CACHE or fetch_qq_leaderboard is None or create_qq_leaderboard_playlist is None:
-        return "音频缓存模块不可用"
-    try:
-        songs = fetch_qq_leaderboard(topid)
-    except Exception as exc:
-        return f"获取「{display_name}」失败: {exc}"
-    if not songs:
-        return f"「{display_name}」没有歌曲数据"
-
-    # 写入 SQLite 创建临时歌单
-    try:
-        list_id = create_qq_leaderboard_playlist(topid, songs)
-    except Exception as exc:
-        return f"创建临时歌单失败: {exc}"
-
-    # 切换到该歌单
-    try:
-        switch_to_local_playlist(list_id)
-        time.sleep(0.5)
-        LxMusicApi.play()
-    except Exception as exc:
-        return f"切换歌单失败: {exc}"
-
-    return f"〖已切换至「{display_name}」〗共 {len(songs)} 首"
+                return f"😢 切换歌单失败了...{exc}"
+    return f"🔍 歌单「{display_name}」在本地没找到呢，先去 Lx Music 中添加一下吧～"
 
 
 def handle_volume(content: str) -> str | None:
@@ -818,8 +867,8 @@ def handle_command(content: str, row: dict[str, Any], queue: SongQueue) -> tuple
             raise LxMusicApi.LxMusicError("点歌内容不能为空。")
         request, position = queue.enqueue(song, row)
         if queue.current:
-            return f"{SONG_FEEDBACK_PREFIX}点歌成功：{request.display_text} (您的歌曲当前位于第{position}位) - {request.user_id}", True
-        return f"{SONG_FEEDBACK_PREFIX}点歌成功：{request.display_text} (即将为您播放) - {request.user_id}", True
+            return f"{SONG_FEEDBACK_PREFIX}✨ 点歌成功：{request.display_text} (排在第{position}位哦～) - {request.user_id}", True
+        return f"{SONG_FEEDBACK_PREFIX}✨ 点歌成功：{request.display_text} (马上就唱给你听～) - {request.user_id}", True
     if content.startswith("播放歌单"):
         return LxMusicApi.play_songlist(content[4:].strip()), True
     if content.startswith("导入歌单"):
@@ -840,16 +889,21 @@ def handle_command(content: str, row: dict[str, Any], queue: SongQueue) -> tuple
     # ==== 新增功能：切换歌单 / 歌单列表 / 当前歌单 / 缓存状态 ====
 
     if HAS_AUDIO_CACHE:
-        switch_match = re.fullmatch(r"切换歌单\s*[：:]?\s*(.+)", content)
+        switch_match = re.fullmatch(r"切换(?:歌单)?\s*[：:]?\s*(.+)", content)
         if switch_match:
-            # 用户主动切换歌单，清空保存状态避免冲突
+            # 用户主动切换歌单，清空点歌队列和保存状态避免冲突
             _saved_playlist.clear()
+            queue.clear_all()
             name = switch_match.group(1).strip()
             key = name.lower().replace(" ", "")
-            # QQ 音乐排行榜优先（直接从 API 拉取实时榜单）
-            if key in QQ_LEADERBOARDS_NORM:
-                display_name, topid = QQ_LEADERBOARDS_NORM[key]
-                return _play_qq_leaderboard(display_name, topid), True
+            # 网易云排行榜（通过 songlist/play 直接播放）
+            if key in WY_LEADERBOARDS_NORM:
+                display_name, bangid = WY_LEADERBOARDS_NORM[key]
+                try:
+                    LxMusicApi.play_songlist(f"wy/{bangid}")
+                    return f"🎶 已切换到「{display_name}」，好听的音乐马上就来～", True
+                except LxMusicApi.LxMusicError as exc:
+                    return f"😢 切换歌单失败了...{exc}", True
             # 预置歌单
             if key in PRESET_NAMES:
                 source, list_id = PRESET_NAMES[key]
@@ -883,26 +937,24 @@ def handle_command(content: str, row: dict[str, Any], queue: SongQueue) -> tuple
                 pass
             # 未找到
             available = "、".join(list(PRESET_PLAYLISTS.keys()))
-            qq_names = "、".join(list(QQ_LEADERBOARDS)[:8])
-            return f"未找到歌单「{name}」。可用预置: {available}，QQ 排行榜: {qq_names}...", True
+            wy_names = "、".join(list(WY_LEADERBOARDS))
+            return f"🔍 没有找到「{name}」呢... 试试这些吧：预置({available}) 网易云排行榜({wy_names})", True
 
     # 歌单列表
     if content in {"歌单列表", "可用歌单"} and HAS_AUDIO_CACHE:
         lines = []
-        hot = ["热歌榜", "抖音热歌榜", "新歌榜", "飙升榜", "流行指数榜"]
-        hot_valid = [n for n in hot if n in QQ_LEADERBOARDS]
+        hot = ["热歌榜", "抖音热歌榜", "新歌榜", "飙升榜", "原创榜"]
+        hot_valid = [n for n in hot if n in WY_LEADERBOARDS]
         if hot_valid:
-            lines.append("【QQ热门】" + " / ".join(hot_valid))
+            lines.append("【网易云热门】" + " / ".join(hot_valid))
         genre = [
-            "内地榜", "欧美榜", "说唱榜", "韩国榜", "日本榜",
-            "香港地区榜", "台湾地区榜", "影视金曲榜", "DJ舞曲榜",
-            "国风热歌榜", "综艺新歌榜", "动漫音乐榜", "游戏音乐榜",
-            "网络歌曲榜", "喜力电音榜", "校园音乐人排行榜",
-            "腾讯音乐人原创榜", "听歌识曲榜", "K歌金曲榜", "有声榜",
+            "说唱榜", "电音榜", "民谣榜", "摇滚榜", "国风榜",
+            "韩语榜", "日语榜", "ACG榜", "古典榜", "网络热歌榜",
+            "欧美热歌榜", "欧美新歌榜",
         ]
-        genre_valid = [n for n in genre if n in QQ_LEADERBOARDS]
+        genre_valid = [n for n in genre if n in WY_LEADERBOARDS]
         if genre_valid:
-            lines.append("【QQ分类】" + " / ".join(genre_valid))
+            lines.append("【网易云分类】" + " / ".join(genre_valid))
         if PRESET_PLAYLISTS:
             lines.append("【预置】" + " / ".join(PRESET_PLAYLISTS.keys()))
         try:
@@ -985,6 +1037,25 @@ def reconnect_api(api: YYCefApi, baseline: dict[str, Any], timeout_seconds: floa
     return prime_seen(api), new_baseline
 
 
+def reconnect_with_channel_reentry(args, api: YYCefApi, baseline: dict[str, Any], sid: int) -> tuple[set[str], dict[str, Any]] | None:
+    """CEF 页面无效且 YY 已退出频道时，通过 yy:// 协议重新进入频道。"""
+    print(f"尝试通过协议重新进入频道 sid={sid}")
+    try:
+        scheme = build_scheme(sid)
+        open_scheme(scheme)
+        page, state = wait_for_switched_page(args, sid, 15, baseline)
+        api.rebind(page)
+        seen = prime_seen(api)
+        new_baseline = capture_page_state(page, state)
+        print("已通过频道重进入重新绑定 YY CEF 页面:")
+        print(describe_page(page))
+        print(json.dumps(state or {}, ensure_ascii=False, indent=2))
+        return seen, new_baseline
+    except Exception as exc:
+        print(f"频道重进入失败: {exc}")
+        return None
+
+
 def switch_channel(api: YYCefApi, args, sid: int) -> tuple[str, set[str], dict[str, Any]]:
     # 先用 yy:// 完成跳转，再重新接管跳转后的原生频道页。
     baseline = current_page_baseline(api)
@@ -995,7 +1066,7 @@ def switch_channel(api: YYCefApi, args, sid: int) -> tuple[str, set[str], dict[s
     api.rebind(page)
     seen = prime_seen(api)
     new_baseline = capture_page_state(page, state)
-    feedback = f"已切换到频道 sid={sid}"
+    feedback = f"🎉 咻~ 已到达频道 {sid}，开始愉快地玩耍吧！"
     print("切换后的 YY CEF 页面:")
     print(describe_page(page))
     print(json.dumps(state or {}, ensure_ascii=False, indent=2))
@@ -1008,6 +1079,39 @@ _welcomed_uids: set[str] = set()
 # 点歌 playlist save/restore：点歌会通过 search_play 替换 Lx Music 上下文，
 # 当点歌队列清空后需要恢复原来的歌单。
 _saved_playlist: dict[str, Any] = {}
+
+
+def _format_now_playing(queue: SongQueue) -> str | None:
+    """检测切歌并返回格式化的当前播放通知，无变化返回 None。"""
+    global _last_song_key
+    try:
+        status = LxMusicApi._player_data(LxMusicApi.get_status())
+    except LxMusicApi.LxMusicError:
+        return None
+    name = LxMusicApi._pick(status, "name", "songName", "title") or ""
+    singer = LxMusicApi._pick(status, "singer", "artist", "author") or ""
+    playing = LxMusicApi.is_playing(status)
+    if not name or not playing:
+        return None
+    song_key = f"{name}|{singer}"
+    if song_key == _last_song_key:
+        return None
+
+    lines = [f"♫ 正在播放：{name} - {singer}"]
+    lines.append("⏮(4) ｜ ⏸(2) ｜ ⏭(5) ｜ ❤")
+
+    if queue.items:
+        parts = []
+        for i, item in enumerate(queue.items, 1):
+            text = item.display_text.replace(" - ", " ")
+            # 截断过长的显示
+            if len(text) > 12:
+                text = text[:12] + "…"
+            parts.append(f"{text}({i})")
+        lines.append("队列：" + " → ".join(parts[:5]))
+
+    _last_song_key = song_key
+    return "\n".join(lines)
 
 
 def _save_current_playlist():
@@ -1045,15 +1149,18 @@ def _restore_saved_playlist() -> str | None:
         switch_to_local_playlist(list_id)
         time.sleep(0.3)
         LxMusicApi.play()
-        return f"已恢复歌单「{pl_name}」"
+        return f"🎶 已恢复歌单「{pl_name}」，继续嗨起来～"
     except Exception as exc:
-        return f"恢复歌单失败: {exc}"
+        return f"😢 恢复歌单失败了...{exc}"
 
 
 def run_bot(args):
     api = YYCefApi(args)
     queue = SongQueue()
     queue.load_state()
+
+    last_sid: int = 0   # 最后成功连接的频道 SID，用于断线重连
+    last_asid: int = 0  # 最后成功连接的频道 ASID（子频道 ID）
 
     # 启动缓存调度器
     cache_scheduler: CacheScheduler | None = None
@@ -1085,8 +1192,15 @@ def run_bot(args):
                     continue
                 baseline = latest_baseline
 
-                # 2. 推进点歌队列，再读取公屏缓存。
+                # 保存当前频道信息用于断线重连
+                if baseline.get("sid"):
+                    last_sid = baseline["sid"]
+                if baseline.get("asid"):
+                    last_asid = baseline["asid"]
+
+                # 2. 推进点歌队列，检测切歌，再读取公屏缓存。
                 update_song_queue(api, queue)
+                now_playing = _format_now_playing(queue)
                 rows = api.read_messages()
             except KeyboardInterrupt:
                 raise
@@ -1096,8 +1210,17 @@ def run_bot(args):
                     seen, baseline = reconnect_api(api, baseline)
                     continue
                 except Exception as reconnect_exc:
-                    print(f"重新绑定失败，将继续重试: {reconnect_exc}")
-                    time.sleep(args.interval)
+                    print(f"重新绑定失败，将尝试重新进入频道: {reconnect_exc}")
+                    # 尝试通过 yy:// 协议重新进入频道
+                    target_sid = last_asid or last_sid
+                    if target_sid:
+                        result = reconnect_with_channel_reentry(args, api, baseline, target_sid)
+                        if result is not None:
+                            seen, baseline = result
+                            continue
+                    # 重进入失败，较长等待后继续重试
+                    print(f"频道重进入失败，5s 后重试")
+                    time.sleep(5)
                     continue
 
             # 3. 对新增公屏消息去重并分发命令。
@@ -1140,7 +1263,7 @@ def run_bot(args):
                     feedback, speak = f"命令处理失败：{exc}", True
 
                 if isinstance(feedback, ChannelSwitchRequest):
-                    pending_text = f"正在切换频道 {feedback.sid}"
+                    pending_text = f"✨ 正在飞往频道 {feedback.sid}，马上就到～"
                     try:
                         send_feedback(api, pending_text)
                     except Exception as exc:
@@ -1155,7 +1278,7 @@ def run_bot(args):
                         feedback_text, seen, baseline = switch_channel(api, args, feedback.sid)
                         send_feedback(api, feedback_text)
                     except Exception as exc:
-                        error_text = f"切换频道失败：{exc}"
+                        error_text = f"💦 频道 {feedback.sid} 暂时去不了呢...{exc}"
                         print(error_text)
                         try:
                             send_feedback(api, error_text)
@@ -1183,6 +1306,12 @@ def run_bot(args):
                             print(f"发送反馈失败，稍后继续重试: {reconnect_exc}")
                             continue
                     update_song_queue(api, queue)
+
+            if now_playing:
+                try:
+                    send_feedback(api, now_playing)
+                except Exception as exc:
+                    print(f"发送切歌通知失败: {exc}")
 
             time.sleep(args.interval)
     except KeyboardInterrupt:

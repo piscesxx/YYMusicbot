@@ -28,6 +28,9 @@ verify_result.txt
 *.exe
 *.7z
 
+# Lx Music 源码（仅供研究，不提交）
+lx-source-tmp/
+
 # 旧版代码
 legacy_uia/
 SendYYMessages.py

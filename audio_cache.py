@@ -61,7 +61,7 @@ POLL_INTERVAL = 3      # 轮询间隔秒数
 
 # 音源脚本路径 (从 test_yy_audio_source.py 沿用)
 ROOT_DIR = Path(__file__).resolve().parent
-DEFAULT_SOURCE_SCRIPT = ROOT_DIR / "sources" / "全豆要-聚合音源 v3.0.0.js"
+DEFAULT_SOURCE_SCRIPT = ROOT_DIR / "sources" / "huibq.js"
 
 
 # ================================================================
@@ -72,20 +72,37 @@ class AudioResolveError(Exception):
     pass
 
 
-def _find_source_script() -> Path:
-    """依次查找可用的音源脚本"""
+def _find_all_source_scripts() -> list[Path]:
+    """返回所有可用音源脚本列表，按优先级排序"""
+    seen: set[Path] = set()
+    scripts: list[Path] = []
+
     candidates = [
         DEFAULT_SOURCE_SCRIPT,
+        ROOT_DIR / "sources" / "huibq.js",
+        Path("sources/huibq.js"),
         ROOT_DIR / "全豆要-聚合音源 v3.0.0.js",
         Path("全豆要-聚合音源 v3.0.0.js"),
-        *list(Path(".").glob("*聚合音源*.js")),
-        *list(Path(".").glob("*音源*.js")),
-        *list(Path("sources").glob("*聚合音源*.js")),
+        *sorted(Path("sources").glob("*聚合音源*.js")),
+        *sorted(Path("sources").glob("*音源*.js")),
+        *sorted(Path("sources").glob("HYWmusic*.js")),
+        *sorted(Path("sources").glob("*.js")),
+        *sorted(Path(".").glob("*聚合音源*.js")),
+        *sorted(Path(".").glob("*音源*.js")),
     ]
     for p in candidates:
-        if p.exists():
-            return p.resolve()
-    raise AudioResolveError("未找到音源脚本 (全豆要-聚合音源*.js)")
+        resolved = p.resolve()
+        if resolved.exists() and resolved not in seen:
+            seen.add(resolved)
+            scripts.append(resolved)
+    if not scripts:
+        raise AudioResolveError("未找到音源脚本 (sources/*.js)")
+    return scripts
+
+
+def _find_source_script() -> Path:
+    """查找优先级最高的音源脚本"""
+    return _find_all_source_scripts()[0]
 
 
 def resolve_audio_url(source: str, song_id: str, name: str, singer: str,
@@ -338,7 +355,7 @@ def read_playback_state() -> dict[str, Any]:
             row = conn.execute("""
                 SELECT m.name, m.singer, m.id
                 FROM my_list_music_info m
-                JOIN my_list_music_info_order o ON m.id = o.musicInfoId
+                JOIN my_list_music_info_order o ON m.id = o.musicInfoId AND m.listId = o.listId
                 WHERE o.listId = ? AND o."order" = ?
             """, (state["listId"], state["index"])).fetchone()
             if row:
@@ -371,9 +388,8 @@ def get_upcoming_songs(list_id: str, current_index: int,
         rows = conn.execute("""
             SELECT m.name, m.singer, m.id, o."order"
             FROM my_list_music_info m
-            JOIN my_list_music_info_order o ON m.id = o.musicInfoId
+            JOIN my_list_music_info_order o ON m.id = o.musicInfoId AND m.listId = o.listId
             WHERE o.listId = ? AND o."order" > ?
-            GROUP BY m.id, o."order"
             ORDER BY o."order" ASC
             LIMIT ?
         """, (list_id, current_index, count)).fetchall()
@@ -397,39 +413,31 @@ def get_upcoming_songs(list_id: str, current_index: int,
 #  QQ 音乐排行榜 API（公开接口，无需 key）
 # ================================================================
 
-# 完整 QQ 音乐排行榜映射 (board__tx__{topid})
-QQ_LEADERBOARDS: dict[str, int] = {
-    "热歌榜": 26,
-    "抖音热歌榜": 60,  # QQ Music 抖快榜
-    "新歌榜": 27,
-    "飙升榜": 62,
-    "流行指数榜": 4,
-    "抖快榜": 60,
-    "内地榜": 5,
-    "欧美榜": 3,
-    "说唱榜": 58,
-    "韩国榜": 16,
-    "日本榜": 17,
-    "香港地区榜": 59,
-    "台湾地区榜": 61,
-    "影视金曲榜": 29,
-    "DJ舞曲榜": 63,
-    "网络歌曲榜": 28,
-    "喜力电音榜": 57,
-    "国风热歌榜": 65,
-    "综艺新歌榜": 64,
-    "动漫音乐榜": 72,
-    "游戏音乐榜": 73,
-    "腾讯音乐人原创榜": 52,
-    "校园音乐人排行榜": 131,
-    "听歌识曲榜": 67,
-    "K歌金曲榜": 36,
-    "有声榜": 75,
+# 网易云音乐排行榜映射 (可直接通过 songlist/play 播放)
+# 格式: "显示名": bangid
+WY_LEADERBOARDS: dict[str, str] = {
+    "热歌榜": "3778678",
+    "抖音热歌榜": "2250011882",  # 网易云抖音榜
+    "新歌榜": "3779629",
+    "飙升榜": "19723756",
+    "原创榜": "2884035",
+    "说唱榜": "991319590",
+    "古典榜": "71384707",
+    "电音榜": "1978921795",
+    "ACG榜": "71385702",
+    "韩语榜": "745956260",
+    "网络热歌榜": "6723173524",
+    "民谣榜": "5059661515",
+    "摇滚榜": "5059633707",
+    "国风榜": "5059642708",
+    "日语榜": "5059644681",
+    "欧美热歌榜": "2809513713",
+    "欧美新歌榜": "2809577409",
 }
 
-# 标准化查询映射 (全小写无空格 → (显示名, topid))
-QQ_LEADERBOARDS_NORM: dict[str, tuple[str, int]] = {
-    k.lower().replace(" ", ""): (k, v) for k, v in QQ_LEADERBOARDS.items()
+# 标准化查询映射 (全小写无空格 → (显示名, bangid))
+WY_LEADERBOARDS_NORM: dict[str, tuple[str, str]] = {
+    k.lower().replace(" ", ""): (k, v) for k, v in WY_LEADERBOARDS.items()
 }
 
 
@@ -650,7 +658,8 @@ def delete_temp_playlist(list_id: str) -> None:
         conn.commit()
         conn.close()
     except (FileNotFoundError, sqlite3.Error):
-        pass
+        import traceback
+        traceback.print_exc()
 
 
 def create_qq_leaderboard_playlist(topid: int, songs: list[dict[str, Any]]) -> str:
@@ -664,8 +673,10 @@ def create_qq_leaderboard_playlist(topid: int, songs: list[dict[str, Any]]) -> s
 
     conn = _db_connect()
     try:
-        # 清理旧临时歌单
-        delete_temp_playlist(list_id)
+        # 在同一连接和事务中清理旧数据，避免并发连接导致的残留
+        conn.execute("DELETE FROM my_list_music_info_order WHERE listId=?", (list_id,))
+        conn.execute("DELETE FROM my_list_music_info WHERE listId=?", (list_id,))
+        conn.execute("DELETE FROM my_list WHERE id=?", (list_id,))
 
         # 创建歌单
         conn.execute(
@@ -685,7 +696,7 @@ def create_qq_leaderboard_playlist(topid: int, songs: list[dict[str, Any]]) -> s
                 (music_id, list_id, song["songName"], song["singer"], "tx", interval_str, meta_str),
             )
             conn.execute(
-                "INSERT INTO my_list_music_info_order (listId, musicInfoId, \"order\") VALUES (?, ?, ?)",
+                "INSERT OR REPLACE INTO my_list_music_info_order (listId, musicInfoId, \"order\") VALUES (?, ?, ?)",
                 (list_id, music_id, order),
             )
 
@@ -988,6 +999,7 @@ class CacheScheduler:
 
         先以歌曲原生 source 尝试解析并缓存；
         若失败则以歌名+歌手为 keyword 对其他源进行搜索降级。
+        若当前音源脚本全部失败，自动换下一个可用脚本重试。
         返回缓存文件路径，完全失败返回 None。
         """
         name = song["name"]
@@ -1012,40 +1024,29 @@ class CacheScheduler:
         if self.quality in fallbacks:
             qualities_to_try.extend(f for f in fallbacks[self.quality] if f not in qualities_to_try)
 
-        # 尝试源列表：原生源 → 降级源
-        source_list = [source] + [s for s in FALLBACK_SOURCES if s != source]
-        last_error = None
-
-        for fb_source in source_list:
+        # 优先查 music_url 表（Lx 内置 SDK 已解析过的 URL）
+        try:
+            conn = _db_connect()
             for q in qualities_to_try:
-                try:
-                    if fb_source == source:
-                        url = resolve_audio_url(source, raw_song_id, name, singer, q, self.source_script)
-                    else:
-                        # 降级源：用歌名代替 ID，由聚合脚本内部处理
-                        url = resolve_audio_url(fb_source, name, name, singer, q, self.source_script)
+                music_key = f"{source}_{raw_song_id}_{q}"
+                row = conn.execute("SELECT url FROM music_url WHERE id=?", (music_key,)).fetchone()
+                if row:
+                    url = row["url"]
+                    if url and "127.0.0.1" not in url and "localhost" not in url:
+                        ext = _guess_ext(url)
+                        filename = _safe_filename(song_id, ext)
+                        dest = CACHE_DIR / filename
+                        if not dest.exists():
+                            download_audio(url, dest)
+                        local_url = self.http_server.url_for(filename)
+                        inject_local_url(song_id, source, local_url, self.quality)
+                        conn.close()
+                        return dest
+            conn.close()
+        except (FileNotFoundError, Exception):
+            pass
 
-                    ext = _guess_ext(url)
-                    filename = _safe_filename(song_id, ext)
-                    dest = CACHE_DIR / filename
-                    if not dest.exists():
-                        download_audio(url, dest)
-
-                    local_url = self.http_server.url_for(filename)
-                    # 始终以原始 source + song_id 注入，确保 Lx Music 能命中本地缓存
-                    inject_local_url(song_id, source, local_url, self.quality)
-                    return dest
-                except (AudioResolveError, subprocess.TimeoutExpired) as e:
-                    last_error = e
-                except Exception as e:
-                    msg = str(e)
-                    if "404" in msg:
-                        last_error = f"{q} 下载 404"
-                    else:
-                        last_error = str(e)
-
-        if last_error:
-            sys.stderr.write(f"[Cache] 所有音质/源缓存失败 [{song.get('order')}] {singer} - {name}: {last_error}\n")
+        # music_url 表没有 → 跳过缓存（改走 Lx 内置 SDK 解析）
         return None
 
 
