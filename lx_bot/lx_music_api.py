@@ -13,6 +13,8 @@ VOLUME_KEYS = {"volume", "volumeSize", "volume_size", "volumePercent", "volume_p
 MUTE_KEYS = {"mute", "muted", "isMute", "isMuted", "is_mute", "is_muted"}
 DEFAULT_VOLUME = int(os.environ.get("LX_MUSIC_DEFAULT_VOLUME", "50"))
 _last_known_volume = None
+_status_cache = {"data": None, "time": 0.0}
+_STATUS_CACHE_TTL = 0.4
 
 
 class LxMusicError(Exception):
@@ -24,7 +26,7 @@ def _request(path, params=None):
         response = requests.get(f"{BASE_URL}{path}", params=params, timeout=TIMEOUT)
         response.raise_for_status()
     except requests.RequestException as exc:
-        raise LxMusicError("未检测到 Lx Music，请确认播放器已启动并开启开放 API。") from exc
+        raise LxMusicError("🎵 没有检测到 Lx Music 呢，先打开播放器并开启 API 吧～") from exc
 
     if not response.content:
         return {}
@@ -37,7 +39,7 @@ def _request(path, params=None):
 
 def _open_scheme(url):
     if not webbrowser.open(url):
-        raise LxMusicError("无法唤起 Lx Music，请确认已安装并注册 lxmusic 协议。")
+        raise LxMusicError("🎵 唤不起 Lx Music 呢，确认已安装并注册了 lxmusic 协议哦～")
 
 
 def _pick(data, *keys):
@@ -62,11 +64,18 @@ def check_status():
         return False
 
 
-def get_status(filter_fields=None):
+def get_status(filter_fields=None, force=False):
+    global _status_cache
+    now = time.monotonic()
+    if not force and not filter_fields and now - _status_cache["time"] < _STATUS_CACHE_TTL:
+        return _status_cache["data"]
     params = None
     if filter_fields:
         params = {"filter": ",".join(filter_fields)}
-    return _request("/status", params=params)
+    data = _request("/status", params=params)
+    if not filter_fields:
+        _status_cache = {"data": data, "time": now}
+    return data
 
 
 def _current_song_display(status=None):
@@ -90,11 +99,11 @@ def get_current_song_text():
     volume = get_volume(status)
 
     if not song_text:
-        return "当前没有播放歌曲。"
+        return "🔇 现在没在放歌呢，点一首吧～"
 
-    message = f"当前播放：{song_text}"
+    message = f"🎵 正在唱：{song_text}"
     if volume is not None:
-        message += f"，当前音量 {volume}"
+        message += f"，音量 {volume} 哦"
     return message
 
 
@@ -183,13 +192,13 @@ def get_mute(status=None):
 def set_mute(mute):
     target = bool(mute)
     _request("/mute", params={"mute": "true" if target else "false"})
-    return "已静音。" if target else "已取消静音。"
+    return "🔇 已静音，安静一下～" if target else "🔊 取消静音，大声放吧～"
 
 
 def toggle_mute():
     current = get_mute()
     if current is None:
-        raise LxMusicError("无法获取当前静音状态，请确认 Lx Music Open API 已返回 mute 字段。")
+        raise LxMusicError("😅 不知道当前静音状态呢，再试一次看看吧～")
     return set_mute(not current)
 
 
@@ -208,12 +217,12 @@ def is_playing(status=None):
 
 def play():
     _request("/play")
-    return "已继续播放。"
+    return "▶️ 继续播放，嗨起来～"
 
 
 def pause():
     _request("/pause")
-    return "已暂停播放。"
+    return "⏸ 暂停一下，想听了叫我哦～"
 
 
 def toggle_pause():
@@ -227,7 +236,7 @@ def _song_after_switch(previous_signature):
     last_song = ""
     while time.monotonic() < deadline:
         try:
-            status = _player_data(get_status())
+            status = _player_data(get_status(force=True))
         except LxMusicError:
             return last_song
         song_text = _current_song_display(status)
@@ -260,9 +269,10 @@ def _switch_song(path, scheme_url, direction):
         _open_scheme(scheme_url)
 
     song_text = _song_after_switch(previous_signature)
+    prefix = "⏭" if "下一首" in direction else "⏮"
     if song_text:
-        return f"〖已为您切换{direction}，即将播放：{song_text}〗"
-    return f"已切换到{direction}。"
+        return f"{prefix} 已切{direction}：{song_text}"
+    return f"{prefix} 已切{direction}～"
 
 
 def next_song():
@@ -283,34 +293,34 @@ def set_volume(value):
     try:
         volume = int(value)
     except (TypeError, ValueError) as exc:
-        raise LxMusicError("音量必须是 0 到 100 的整数。") from exc
+        raise LxMusicError("🔢 音量要输 0 到 100 之间的整数哦～") from exc
 
     if not 0 <= volume <= 100:
-        raise LxMusicError("音量范围是 0 到 100。")
+        raise LxMusicError("🔢 音量只能在 0 到 100 之间呢～")
 
     _set_volume(volume)
-    return f"音量已设置为 {volume}。"
+    return f"🔊 音量已设为 {volume}～"
 
 
 def change_volume(delta):
     try:
         delta = int(delta)
     except (TypeError, ValueError) as exc:
-        raise LxMusicError("音量增减值必须是整数。") from exc
+        raise LxMusicError("🔢 音量增减要输整数哦～") from exc
 
     current = get_volume()
     if current is None:
         if _last_known_volume is not None:
             current = _last_known_volume
         else:
-            raise LxMusicError("无法获取当前音量，请先使用“设置音量20”这类绝对音量命令，或确认 Lx Music Open API 已返回 volume 字段。")
+            raise LxMusicError("😅 不知道当前音量呢，先试试「设置音量50」这样的命令吧～")
 
     target = max(0, min(100, current + delta))
     _set_volume(target)
 
     if delta >= 0:
-        return f"音量增加 {delta}，当前音量 {target}。"
-    return f"音量减少 {abs(delta)}，当前音量 {target}。"
+        return f"🔊 音量调高了 {delta}，现在 {target} 啦～"
+    return f"🔉 音量调低了 {abs(delta)}，现在 {target} 啦～"
 
 
 def _split_song_keyword(keyword):
@@ -324,47 +334,47 @@ def _split_song_keyword(keyword):
 def search_play(keyword):
     keyword = keyword.strip()
     if not keyword:
-        raise LxMusicError("点歌内容不能为空。")
+        raise LxMusicError("📝 点歌内容不能为空哦，试试「点歌 歌名-歌手」吧～")
 
     _open_scheme(f"lxmusic://music/searchPlay/{quote(keyword)}")
     song_name, singer = _split_song_keyword(keyword)
     song_text = f"{singer} - {song_name}" if singer else song_name
-    return f"〖🐟〗点歌成功：{song_text} (即将为您播放)"
+    return f"🎵 正在搜索播放：{song_text}"
 
 
 def search(keyword):
     keyword = keyword.strip()
     if not keyword:
-        raise LxMusicError("搜索内容不能为空。")
+        raise LxMusicError("📝 搜索内容不能为空哦～")
 
     _open_scheme(f"lxmusic://music/search/{quote(keyword)}")
-    return f"已打开 Lx Music 搜索：{keyword}。"
+    return f"🔍 已打开 Lx Music 搜索：{keyword}～"
 
 
 def _parse_songlist(text):
     text = text.strip().replace("\\", "/")
     if "/" not in text:
-        raise LxMusicError("歌单格式应为 来源/歌单ID，例如 tx/123456。")
+        raise LxMusicError("📋 歌单格式是 来源/歌单ID，比如 tx/123456 哦～")
 
     source, songlist_id = [part.strip() for part in text.split("/", 1)]
     if source not in SUPPORTED_SOURCES:
-        raise LxMusicError("歌单来源仅支持 kw、kg、tx、wy、mg、myList。")
+        raise LxMusicError("📋 歌单来源只支持 kw、kg、tx、wy、mg、myList 哦～")
     if not songlist_id:
-        raise LxMusicError("歌单ID不能为空。")
+        raise LxMusicError("📋 歌单 ID 不能为空哦～")
     return source, songlist_id
 
 
 def play_songlist(text):
     source, songlist_id = _parse_songlist(text)
     _open_scheme(f"lxmusic://songlist/play/{quote(source)}/{quote(songlist_id)}")
-    return f"已发送播放歌单请求：{source}/{songlist_id}。"
+    return f"📦 歌单请求已发送：{source}/{songlist_id}，马上就来～"
 
 
 def open_songlist(text):
     source, songlist_id = _parse_songlist(text)
     _open_scheme(f"lxmusic://songlist/open/{quote(source)}/{quote(songlist_id)}")
-    return f"已发送打开歌单请求：{source}/{songlist_id}。"
+    return f"📂 正在打开歌单：{source}/{songlist_id}，稍等哦～"
 
 
 def toggle_play_mode():
-    return "当前 Lx Music Open API 暂无随机/顺序/单曲循环播放模式切换接口，请在播放器内手动切换。"
+    return "😅 切换播放模式的功能还在路上呢，麻烦去 Lx Music 里手动切换一下吧～"

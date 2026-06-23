@@ -50,6 +50,15 @@ except ImportError:
 # 切歌检测
 _last_song_key: str = ""
 
+# 播放通知开关
+_now_playing_enabled = True
+
+# 导航状态 — 点歌和歌单之间的切换
+_anchor_keyword: str = ""          # 锚点歌关键词（点歌时正在播放的歌单歌）
+_last_user_song: str = ""          # 最后点的歌的关键词
+_in_user_song_mode: bool = False   # True=正在播放用户点的歌
+_at_boundary: bool = False         # 刚从用户模式切回Lx歌单，按4应回退到最后点的歌
+
 
 HTTP_TIMEOUT = 0.25
 WS_TIMEOUT = 5
@@ -85,7 +94,6 @@ CHANNEL_STATE_EXPRESSION = r"""
 """
 START_SIGNATURE_DELAY = 3
 MIN_SONG_SECONDS = 15
-SONG_FEEDBACK_PREFIX = "〖🐟〗"
 QUEUE_STATE_FILE = Path(__file__).resolve().parent / "song_queue.json"
 HELP_TEXT = """【播放控制】
 1=当前歌曲  2=暂停/继续  4=上一首  5/切歌=下一首  6=静音
@@ -96,7 +104,8 @@ HELP_TEXT = """【播放控制】
 切换: 切换歌单 热歌榜
 【查询】
 当前歌单 / 歌单列表 / 缓存状态
-0 / 帮助 / 菜单 = 本帮助"""
+0 / 帮助 / 菜单 = 本帮助
+💡 输入上面的命令和我玩吧～"""
 
 
 @dataclass
@@ -139,26 +148,32 @@ class SongQueue:
     # ---- 持久化 ----
 
     def save_state(self):
-        """将排队的点歌写入文件，重启后恢复。"""
+        """将排队的点歌及导航状态写入文件，重启后恢复。"""
         data = {
             "items": [asdict(r) for r in self.items],
             "history": [asdict(r) for r in self.history],
+            "nav": {
+                "anchor_keyword": _anchor_keyword,
+                "last_user_song": _last_user_song,
+                "in_user_song_mode": _in_user_song_mode,
+                "at_boundary": _at_boundary,
+            },
         }
         try:
             QUEUE_STATE_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         except OSError as exc:
             print(f"保存点歌队列失败: {exc}")
 
-    def load_state(self):
-        """从文件恢复排队点歌。"""
+    def load_state(self) -> dict:
+        """从文件恢复排队点歌，返回额外的导航状态。"""
         try:
             text = QUEUE_STATE_FILE.read_text(encoding="utf-8")
         except (FileNotFoundError, OSError):
-            return
+            return {}
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
-            return
+            return {}
         for key in ("items", "history"):
             for item in data.get(key, []):
                 req = SongRequest(**item)
@@ -168,6 +183,7 @@ class SongQueue:
                     self.history.append(req)
         if self.items:
             print(f"已恢复点歌队列，共 {len(self.items)} 首待播放，{len(self.history)} 首历史")
+        return data.get("nav", {})
 
     # ---- 操作 ----
 
@@ -524,9 +540,13 @@ def pick_channel_page(args, strict_channel: bool = False,
         ))
         return candidates[0][0], None
     for page in scan_pages():
-        if "yy.com" in page.url.lower():
-            enrich_page(page)
+        if "yy.com" not in page.url.lower():
+            continue
+        enrich_page(page)
+        state = read_channel_state(page)
+        if state and state.get("hasChannelMessage"):
             return page, None
+        time.sleep(0.3)
     return None, "未找到 YY CEF 频道页面，请确认 YY 客户端已登录并进入频道，或检查 --uid/--channel 是否正确。"
 
 
@@ -681,7 +701,14 @@ def is_lx_playing() -> bool:
         return False
 
 
-def start_song_request(request: SongRequest) -> str:
+def start_song_request(request: SongRequest) -> None:
+    global _in_user_song_mode, _at_boundary, _last_user_song
+
+    # 设置导航状态 — 进入用户点歌模式
+    _in_user_song_mode = True
+    _at_boundary = False
+    _last_user_song = request.keyword
+
     # 拍照：记录当前 music_url 表的 key，用于后续对比找出新增的 URL
     before_keys = _snapshot_music_url_keys() if HAS_AUDIO_CACHE else set()
 
@@ -690,7 +717,6 @@ def start_song_request(request: SongRequest) -> str:
     if HAS_AUDIO_CACHE:
         threading.Thread(target=_cache_point_song_delayed,
                          args=(request.keyword, before_keys), daemon=True).start()
-    return f"〖即将为您播放：{request.display_text}〗"
 
 
 def _snapshot_music_url_keys() -> set[str]:
@@ -747,14 +773,41 @@ def _cache_point_song_delayed(keyword: str, before_keys: set[str], delay: int = 
 
 
 def play_previous_request(queue: SongQueue) -> str:
+    global _in_user_song_mode, _at_boundary, _last_user_song
+
+    # ① 队列历史有歌 → searchPlay 历史歌曲
     request = queue.replay_previous()
-    if not request:
-        return LxMusicApi.previous_song()
-    LxMusicApi.search_play(request.keyword)
-    return f"〖已为您切换上一首，即将播放：{request.display_text}〗"
+    if request:
+        LxMusicApi.search_play(request.keyword)
+        _in_user_song_mode = True
+        _at_boundary = False
+        _last_user_song = request.keyword
+        queue.save_state()
+        return f"⏮ 回到上一首：{request.display_text}"
+
+    # ② 在边界且还有最后点的歌 → 回到用户模式
+    if _at_boundary and _last_user_song:
+        _in_user_song_mode = True
+        _at_boundary = False
+        LxMusicApi.search_play(_last_user_song)
+        queue.save_state()
+        return f"⏮ 飞回来啦，再唱一遍你点的歌～"
+
+    # ③ 在用户模式且保存了锚点 → 回到歌单歌曲
+    if _in_user_song_mode and _anchor_keyword:
+        _in_user_song_mode = False
+        _at_boundary = True
+        LxMusicApi.search_play(_anchor_keyword)
+        queue.save_state()
+        return f"⏮ 回歌单啦，继续放榜单好歌～"
+
+    # ④ 其他 → Lx 默认上一首
+    return LxMusicApi.previous_song()
 
 
 def update_song_queue(api: YYCefApi, queue: SongQueue):
+    global _in_user_song_mode, _at_boundary
+
     if queue.current and not queue.current_finished():
         return
 
@@ -765,6 +818,9 @@ def update_song_queue(api: YYCefApi, queue: SongQueue):
     if not queue.has_pending():
         feedback = _restore_saved_playlist()
         if feedback:
+            _in_user_song_mode = False
+            _at_boundary = True
+            queue.save_state()
             send_feedback(api, feedback)
         return
 
@@ -775,8 +831,8 @@ def update_song_queue(api: YYCefApi, queue: SongQueue):
     if not request:
         return
 
-    feedback = start_song_request(request)
-    send_feedback(api, feedback)
+    start_song_request(request)
+    queue.save_state()
 
 
 def _switch_board_playlist(source: str, source_list_id: str, display_name: str) -> str:
@@ -814,6 +870,7 @@ def handle_volume(content: str) -> str | None:
 
 
 def handle_command(content: str, row: dict[str, Any], queue: SongQueue) -> tuple[str | ChannelSwitchRequest | ReadAloudRequest | None, bool]:
+    global _now_playing_enabled, _in_user_song_mode, _at_boundary, _anchor_keyword
     content = content.strip()
     if not content:
         return None, False
@@ -847,8 +904,17 @@ def handle_command(content: str, row: dict[str, Any], queue: SongQueue) -> tuple
             queue.clear_current()
             request = queue.pop_next()
             if request:
-                return start_song_request(request), True
-        # 没有排队的点歌了 → 恢复歌单（如有）
+                start_song_request(request)
+                queue.save_state()
+                return f"⏭ 已切歌，接下来播放：{request.display_text}", True
+        # 没有排队的点歌了 → 回到歌单
+        _in_user_song_mode = False
+        _at_boundary = True
+        queue.save_state()
+        # 有锚点 → searchPlay 回到歌单歌曲
+        if _anchor_keyword:
+            LxMusicApi.search_play(_anchor_keyword)
+            return f"⏭ 点歌唱完啦，回歌单继续嗨～", True
         if _saved_playlist:
             queue.current = None
             queue.current_signature = None
@@ -864,11 +930,22 @@ def handle_command(content: str, row: dict[str, Any], queue: SongQueue) -> tuple
     if content.startswith("点歌"):
         song = content[2:].strip()
         if not song:
-            raise LxMusicApi.LxMusicError("点歌内容不能为空。")
+            raise LxMusicApi.LxMusicError("📝 点歌内容不能为空哦，试试「点歌 歌名-歌手」吧～")
+        # 第一次点歌时立即存锚点（当前正在播的歌），不等到 searchPlay 再存
+        if not _anchor_keyword:
+            try:
+                status = LxMusicApi._player_data(LxMusicApi.get_status())
+                name = LxMusicApi._pick(status, "name", "songName", "title") or ""
+                singer = LxMusicApi._pick(status, "singer", "artist", "author") or ""
+                if name:
+                    _anchor_keyword = f"{name}-{singer}" if singer else name
+                    queue.save_state()
+            except Exception:
+                pass
         request, position = queue.enqueue(song, row)
         if queue.current:
-            return f"{SONG_FEEDBACK_PREFIX}✨ 点歌成功：{request.display_text} (排在第{position}位哦～) - {request.user_id}", True
-        return f"{SONG_FEEDBACK_PREFIX}✨ 点歌成功：{request.display_text} (马上就唱给你听～) - {request.user_id}", True
+            return f"🎵 已加入排队（第 {position} 位）：{request.display_text} - {request.user_id}", True
+        return f"🎵 马上为你唱：{request.display_text} - {request.user_id}", True
     if content.startswith("播放歌单"):
         return LxMusicApi.play_songlist(content[4:].strip()), True
     if content.startswith("导入歌单"):
@@ -877,13 +954,13 @@ def handle_command(content: str, row: dict[str, Any], queue: SongQueue) -> tuple
     # 查看点歌队列
     if content in {"点歌队列", "歌曲队列", "排队"}:
         if not queue.items and not queue.current:
-            return "点歌队列为空", True
+            return "📭 点歌队列空空的呢，快来点首歌吧～", True
         lines = []
         if queue.current:
-            lines.append(f"正在播放：{queue.current.display_text}")
+            lines.append(f"🎶 当前播放：{queue.current.display_text}")
         if queue.items:
             for i, item in enumerate(queue.items, 1):
-                lines.append(f"{i}. {item.display_text}")
+                lines.append(f"  {i}️⃣ {item.display_text}")
         return "\n".join(lines), True
 
     # ==== 新增功能：切换歌单 / 歌单列表 / 当前歌单 / 缓存状态 ====
@@ -894,6 +971,11 @@ def handle_command(content: str, row: dict[str, Any], queue: SongQueue) -> tuple
             # 用户主动切换歌单，清空点歌队列和保存状态避免冲突
             _saved_playlist.clear()
             queue.clear_all()
+            _anchor_keyword = ""
+            _last_user_song = ""
+            _in_user_song_mode = False
+            _at_boundary = False
+            queue.save_state()
             name = switch_match.group(1).strip()
             key = name.lower().replace(" ", "")
             # 网易云排行榜（通过 songlist/play 直接播放）
@@ -968,8 +1050,17 @@ def handle_command(content: str, row: dict[str, Any], queue: SongQueue) -> tuple
         except Exception:
             pass
         if not lines:
-            lines.append("暂无可用歌单。")
+            lines.append("📭 还没有可用的歌单呢，去 Lx Music 添加一些吧～")
+        lines.insert(0, "📚 以下是可以切换的歌单哦～")
         return "\n".join(lines), True
+
+    # 开启/关闭播放通知
+    if content == "开启播放通知":
+        _now_playing_enabled = True
+        return "🎵 播放通知已开启，每切歌都会告诉你哦～", True
+    if content == "关闭播放通知":
+        _now_playing_enabled = False
+        return "🔇 播放通知已关闭，想听的时候再叫我打开吧～", True
 
     # 当前歌单信息
     if content == "当前歌单" and HAS_AUDIO_CACHE:
@@ -981,9 +1072,9 @@ def handle_command(content: str, row: dict[str, Any], queue: SongQueue) -> tuple
                 song_text = f"{cur.get('singer', '')} - {cur.get('name', '')}"
             else:
                 song_text = "无"
-            return f"当前歌单：{pl_name}\n当前歌曲：{song_text}\n位置：{state.get('index', 0)}", True
+            return f"🎵 当前歌单：{pl_name}\n🎤 正在唱：{song_text}\n📍 第 {state.get('index', 0)} 首", True
         except Exception as exc:
-            return f"读取状态失败: {exc}", True
+            return f"😵 读取歌单状态出了点小状况...{exc}", True
 
     # 缓存状态
     if content == "缓存状态" and HAS_AUDIO_CACHE:
@@ -993,10 +1084,10 @@ def handle_command(content: str, row: dict[str, Any], queue: SongQueue) -> tuple
                 files = list(CACHE_DIR.iterdir())
                 file_count = len(files)
                 total_size = sum(f.stat().st_size for f in files) / (1024 * 1024)
-                return f"缓存状态：{file_count} 个文件 ({total_size:.1f} MB)", True
-            return "缓存目录不存在", True
+                return f"💾 已缓存 {file_count} 首歌，约 {total_size:.1f} MB，离线也能听哦～", True
+            return "📭 还没有缓存文件呢，播几首歌就有了～", True
         except Exception as exc:
-            return f"缓存状态读取失败: {exc}", True
+            return f"😵 读取缓存状态出了点小状况...{exc}", True
 
     return None, False
 
@@ -1030,6 +1121,9 @@ def current_page_baseline(api: YYCefApi) -> dict[str, Any]:
 def reconnect_api(api: YYCefApi, baseline: dict[str, Any], timeout_seconds: float = 12) -> tuple[set[str], dict[str, Any]]:
     page = api.reconnect(baseline=baseline, timeout_seconds=timeout_seconds)
     state = read_channel_state(page)
+    # 确保绑到的是真的频道页（有公屏消息能力），否则重试
+    if not state or not state.get("hasChannelMessage"):
+        raise RuntimeError(f"绑定了非频道页: {page.title}")
     new_baseline = capture_page_state(page, state)
     print("已重新绑定 YY CEF 页面:")
     print(describe_page(page))
@@ -1097,8 +1191,8 @@ def _format_now_playing(queue: SongQueue) -> str | None:
     if song_key == _last_song_key:
         return None
 
-    lines = [f"♫ 正在播放：{name} - {singer}"]
-    lines.append("⏮(4) ｜ ⏸(2) ｜ ⏭(5) ｜ ❤")
+    lines = [f"🎧 正在播放：{name} - {singer}"]
+    lines.append("⏮(4) ｜ ⏸(2) ｜ ⏭(5)")
 
     if queue.items:
         parts = []
@@ -1108,7 +1202,7 @@ def _format_now_playing(queue: SongQueue) -> str | None:
             if len(text) > 12:
                 text = text[:12] + "…"
             parts.append(f"{text}({i})")
-        lines.append("队列：" + " → ".join(parts[:5]))
+        lines.append("📋 " + " → ".join(parts[:5]))
 
     _last_song_key = song_key
     return "\n".join(lines)
@@ -1145,6 +1239,9 @@ def _restore_saved_playlist() -> str | None:
     _saved_playlist = {}
     if not list_id:
         return None
+    if list_id == "temp":
+        # temp 是 Lx 内部临时列表，不在 my_list 表中，无法恢复
+        return None
     try:
         switch_to_local_playlist(list_id)
         time.sleep(0.3)
@@ -1155,9 +1252,17 @@ def _restore_saved_playlist() -> str | None:
 
 
 def run_bot(args):
+    global _anchor_keyword, _last_user_song, _in_user_song_mode, _at_boundary
     api = YYCefApi(args)
     queue = SongQueue()
-    queue.load_state()
+    nav_state = queue.load_state()
+    if nav_state:
+        _anchor_keyword = nav_state.get("anchor_keyword", "")
+        _last_user_song = nav_state.get("last_user_song", "")
+        _in_user_song_mode = nav_state.get("in_user_song_mode", False)
+        _at_boundary = nav_state.get("at_boundary", False)
+        if _in_user_song_mode or _at_boundary:
+            print(f"已恢复导航状态: anchor={_anchor_keyword[:20]} last={_last_user_song[:20]} mode={_in_user_song_mode} boundary={_at_boundary}")
 
     last_sid: int = 0   # 最后成功连接的频道 SID，用于断线重连
     last_asid: int = 0  # 最后成功连接的频道 ASID（子频道 ID）
@@ -1260,7 +1365,7 @@ def run_bot(args):
                 except LxMusicApi.LxMusicError as exc:
                     feedback, speak = str(exc), True
                 except Exception as exc:
-                    feedback, speak = f"命令处理失败：{exc}", True
+                    feedback, speak = f"😯 出了点小状况...{exc}", True
 
                 if isinstance(feedback, ChannelSwitchRequest):
                     pending_text = f"✨ 正在飞往频道 {feedback.sid}，马上就到～"
@@ -1307,7 +1412,7 @@ def run_bot(args):
                             continue
                     update_song_queue(api, queue)
 
-            if now_playing:
+            if now_playing and _now_playing_enabled:
                 try:
                     send_feedback(api, now_playing)
                 except Exception as exc:

@@ -54,8 +54,8 @@ PRESET_NAMES = {k.lower().replace(" ", ""): v for k, v in PRESET_PLAYLISTS.items
 
 CACHE_DIR = Path(__file__).resolve().parent / "audio_cache"
 CACHE_HTTP_PORT = 18908
-CACHE_MAX_AGE = 7200  # 缓存文件保留秒数 (2小时)
-PRE_CACHE_COUNT = 3    # 提前缓存几首歌
+CACHE_MAX_AGE = 86400  # 缓存文件保留秒数 (24小时)
+PRE_CACHE_COUNT = 5    # 提前缓存几首歌
 RESOLVE_TIMEOUT = 30   # 音源脚本超时秒数
 POLL_INTERVAL = 3      # 轮询间隔秒数
 
@@ -922,6 +922,27 @@ class CacheScheduler:
         if not list_id:
             return
 
+        # 缓存当前正在播的歌（它的 URL 已在 music_url 表中）
+        cur_song = state.get("current_song")
+        if cur_song and cur_song.get("id"):
+            cur_order = cur_index
+            if cur_order not in self._cached_orders:
+                song = {
+                    "id": cur_song["id"],
+                    "name": cur_song.get("name", ""),
+                    "singer": cur_song.get("singer", ""),
+                    "source": cur_song.get("source", "tx"),
+                    "order": cur_order,
+                }
+                try:
+                    fpath = self._cache_one(song)
+                    if fpath:
+                        self._cached_orders.add(cur_order)
+                        self._order_to_file[cur_order] = fpath
+                except Exception as exc:
+                    sys.stderr.write(f"[Cache] current song cache failed: {exc}\n")
+
+
         upcoming = get_upcoming_songs(list_id, cur_index, self.pre_cache_count)
         if not upcoming:
             return
@@ -1046,7 +1067,22 @@ class CacheScheduler:
         except (FileNotFoundError, Exception):
             pass
 
-        # music_url 表没有 → 跳过缓存（改走 Lx 内置 SDK 解析）
+        # music_url 表没有 → 用 JS 音源脚本解析 URL
+        for q in qualities_to_try:
+            try:
+                url = resolve_audio_url(source, raw_song_id, name, singer, q, self.source_script)
+                if url:
+                    ext = _guess_ext(url)
+                    filename = _safe_filename(song_id, ext)
+                    dest = CACHE_DIR / filename
+                    if not dest.exists():
+                        download_audio(url, dest)
+                    local_url = self.http_server.url_for(filename)
+                    inject_local_url(song_id, source, local_url, self.quality)
+                    return dest
+            except Exception:
+                continue
+
         return None
 
 
